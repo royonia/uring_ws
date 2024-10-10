@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 fn main() {
     // Tell cargo to look for the shared library in the `liburing` directory
-    let liburing_path = PathBuf::from("/home/roytang/github/liburing/src");
+    let liburing_path = PathBuf::from("/usr/lib");
 
     // Set the library search path for the linker to find liburing.so
     println!("cargo:rustc-link-search=native={}", liburing_path.display());

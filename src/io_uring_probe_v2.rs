@@ -1,17 +1,17 @@
 use log::info;
-use websocket::WebsocketHandler;
+use tungstenite::protocol::WebSocketContext;
 
-use crate::op::*;
-use crate::ring::io_uring_buf_ring_add;
+use crate::ring::{io_uring_buf_ring_add, Ring};
 use crate::sys::{self as libc};
+use crate::{op::*, Event, UserData};
 use crate::{BGID, BUF_SIZE, RING_POOL_SIZE};
 use core::panic;
+use std::io;
 use std::{
     ffi::CString,
-    io::{Cursor, Read},
     mem::MaybeUninit,
     ops::DerefMut,
-    os::fd::{AsRawFd, RawFd},
+    os::fd::RawFd,
     ptr,
     sync::{
         atomic::{self, AtomicU32},
@@ -61,6 +61,9 @@ pub fn probe_sys_uring() {
         )
     };
 
+    // ring wrapper instance
+    let _ring = Ring { ring_ptr, buf_ring };
+
     for (i, _) in bufs.iter_mut().enumerate() {
         let addr = unsafe { bufs_addr.add(i * buf_size as usize) };
         //ring_buf.write(libc::io_uring_buf {
@@ -100,8 +103,9 @@ pub fn probe_sys_uring() {
     let mut handlers = vec![];
     let mut streams = vec![];
     for _ in 0..1 {
-        let (fd, ws) = init_tcp_stream();
-        let handler = WebsocketHandler::default();
+        let (fd, ws) = init_tcp_stream(_ring.clone());
+        let handler =
+            WebSocketContext::new(tungstenite::protocol::Role::Client, Default::default());
         handlers.push(handler);
         streams.push(ws);
         //let fd = stream.as_raw_fd();
@@ -109,8 +113,8 @@ pub fn probe_sys_uring() {
         //read_at(unsafe { &mut *sqe }, fd, ptr::null_mut(), buf_size, 0);
 
         let sqe = io_uring_get_sqe(&mut ring).unwrap();
-        let sqe_id = (handlers.len() - 1) as u64;
-        unsafe { (&mut *sqe).user_data = sqe_id };
+        let user_data = UserData::from_parts(Event::MultishortRecv as _, 0, 1201);
+        unsafe { (&mut *sqe).user_data = user_data.as_u64() };
         //recv(unsafe { &mut *sqe }, fd, ptr::null_mut(), 0, 0);
         multishot_recv(unsafe { &mut *sqe }, fd, 0, BGID);
     }
@@ -142,73 +146,54 @@ pub fn probe_sys_uring() {
 
         for cqe_idx in 0..rval {
             let cqe = cqe_buf[cqe_idx as usize];
-            info!("{cqe_idx}: {}", unsafe { &mut *cqe }.user_data);
-            info!("cqe_res: {}", unsafe { &mut *cqe }.res);
-            info!(
-                "IORING_CQE_F_BUFFER: {}",
-                unsafe { &mut *cqe }.flags & libc::IORING_CQE_F_BUFFER
-            );
-            info!(
-                "IORING_CQE_BUFFER_SHIFT: {}",
-                unsafe { &mut *cqe }.flags >> libc::IORING_CQE_BUFFER_SHIFT
-            );
             let cqe = unsafe { &mut *cqe };
-            let buffer_id = cqe.flags >> libc::IORING_CQE_BUFFER_SHIFT;
-            let buf = &bufs[buffer_id as usize];
-            let buf = unsafe { buf.assume_init() };
             if cqe.res < 0 {
                 let os_err = std::io::Error::from_raw_os_error(cqe.res.abs());
                 panic!("cqe error: {os_err}");
             } else {
-                let data_len = cqe.res as usize;
                 assert!(cqe.res > 0);
-                let data = unsafe { std::slice::from_raw_parts_mut(buf.addr as *mut u8, data_len) };
                 //let decoded = String::from_utf8_lossy(data);
                 // decode ssl
-                let ws = &mut streams[cqe.user_data as usize];
-                let handler = &mut handlers[cqe.user_data as usize];
+                let user_data = UserData::from_packed(cqe.user_data);
+                let ws = streams.get_mut(user_data.owner() as usize).unwrap();
                 match ws.get_mut() {
-                    tungstenite::stream::MaybeTlsStream::Rustls(s) => {
-                        let ret = s.conn.read_tls(&mut std::io::Cursor::new(&data)).unwrap();
-                        assert!(ret > 0);
-                        let ssl_state = s.conn.process_new_packets().unwrap();
-                        let mut remaining = ssl_state.plaintext_bytes_to_read();
-                        assert!(!ssl_state.peer_has_closed());
-                        // here original data buf is not useful anymore
-                        // reuse it before yielding back to kernal to avoid extra allocation
-                        while remaining > 0 {
-                            let partial_data_len = data_len.min(remaining);
-                            remaining -= partial_data_len;
-                            let partial_buf = &mut data[0..partial_data_len];
-                            s.conn.reader().read_exact(partial_buf).unwrap();
-                            //println!("processed partial_buf {} bytes", partial_data_len);
-                            for s in handler.add_data(partial_buf) {
-                                info!("{s}");
+                    tungstenite::stream::MaybeTlsStream::NativeTls(s) => {
+                        let stream = s.get_mut();
+                        //let stream = &mut s.sock;
+                        unsafe { stream._on_cqe(cqe).unwrap() };
+
+                        let handler = handlers.get_mut(user_data.owner() as usize).unwrap();
+                        match handler.read_message_frame(s) {
+                            Ok(Some(msg)) => log::info!("{msg}"),
+                            Ok(None) => (),
+                            Err(tungstenite::Error::Io(io_err)) => {
+                                if io_err.kind() == io::ErrorKind::WouldBlock {
+                                    // not enough data to complete a frame read
+                                }
                             }
-                        }
-                        assert_eq!(remaining, 0);
+                            Err(err) => panic!("{err}"),
+                        };
                     }
                     tungstenite::stream::MaybeTlsStream::Plain(s) => {
                         todo!()
                     }
                     _ => unimplemented!(),
                 }
-                //println!("{data:?}");
             }
 
             // yield back the buffer ownership to kernal
             // atomic::compiler_fence(atomic::Ordering::Release);
-            unsafe {
-                io_uring_buf_ring_add(
-                    buf_ring,
-                    buf.addr as _,
-                    buf_size,
-                    buffer_id as _,
-                    io_uring_buf_ring_mask(pool_size) as _,
-                    0,
-                )
-            };
-            unsafe { io_uring_buf_ring_advance(buf_ring, 1 as _) };
+            //unsafe {
+            //    io_uring_buf_ring_add(
+            //        buf_ring,
+            //        buf.addr as _,
+            //        buf_size,
+            //        buffer_id as _,
+            //        io_uring_buf_ring_mask(pool_size) as _,
+            //        0,
+            //    )
+            //};
+            //unsafe { io_uring_buf_ring_advance(buf_ring, 1 as _) };
             unsafe { io_uring_cq_advance(&mut ring, 1) };
         }
     }
@@ -329,11 +314,13 @@ fn page_size() -> usize {
 /// what we want is an easy way to perform websocket upgrade and handshake
 /// having tungstenite WebSocket stream however is useful when we don't care to pay some cost of
 /// syscall for sending message to websocket directly
-fn init_tcp_stream() -> (
+fn init_tcp_stream(
+    ring: Ring,
+) -> (
     RawFd,
-    tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<std::net::TcpStream>>,
+    tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<crate::net::TcpStream>>,
 ) {
-    use tungstenite::{self, connect};
+    use tungstenite::{self, client_tls_with_config};
 
     static INSTALL_ONCE: OnceLock<bool> = OnceLock::new();
     INSTALL_ONCE.get_or_init(|| {
@@ -343,7 +330,17 @@ fn init_tcp_stream() -> (
         true
     });
     //let (mut ws, response) = connect("ws://0.0.0.0:8765").unwrap();
-    let (mut ws, response) = connect("wss://ws.okx.com:8443/ws/v5/public").unwrap();
+    //let (mut ws, response) = connect("wss://ws.okx.com:8443/ws/v5/public").unwrap();
+
+    let tcp_stream = std::net::TcpStream::connect("ws.okx.com:8443").unwrap();
+    let (mut ws, response) = client_tls_with_config(
+        "wss://ws.okx.com:8443/ws/v5/public",
+        //tcp_stream,
+        crate::net::TcpStream::new_from_std(tcp_stream, ring, 0),
+        Default::default(),
+        None,
+    )
+    .unwrap();
     info!("{response:?}");
     ws.send(
         r#"
@@ -365,6 +362,7 @@ fn init_tcp_stream() -> (
         Err(_) => todo!(),
     };
     info!("{msg}");
+    ws.flush().unwrap();
 
     let fd = match ws.get_mut() {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => {
@@ -375,11 +373,11 @@ fn init_tcp_stream() -> (
         // NOTE: native-tls is tough to work with due to the fact that under the hood
         //  it performs (non)blocking IO read through ffi ssl_read(3) to native openssl
         //
-        //tungstenite::stream::MaybeTlsStream::NativeTls(stream) => {
-        //    stream.get_mut().set_nonblocking(true).unwrap();
-        //    stream.get_mut().set_nodelay(true).unwrap();
-        //    stream.get_mut().as_raw_fd()
-        //}
+        tungstenite::stream::MaybeTlsStream::NativeTls(stream) => {
+            stream.get_mut().set_nonblocking(true).unwrap();
+            stream.get_mut().set_nodelay(true).unwrap();
+            stream.get_mut().as_raw_fd()
+        }
         // NOTE: rustls in comparsion exposes the underlying ssl_reader which takes any chunk of
         //  bytes and perform the decoding for us. the IO is very loosly coupled with ssl stream decoder
         //  which is exactly what we want because is real IO is performed by io_uring
@@ -391,98 +389,4 @@ fn init_tcp_stream() -> (
         _ => unimplemented!(),
     };
     (fd, ws)
-}
-
-/// just any lightweight websocket frame decoder should work
-mod websocket {
-    use log::info;
-    use websocket_sans_io::{
-        FrameInfo, Opcode, WebsocketFrameDecoder,
-        WebsocketFrameEvent::{End, PayloadChunk, Start},
-    };
-
-    #[derive(Default)]
-    pub struct WebsocketHandler {
-        frame_decoder: WebsocketFrameDecoder,
-        str_acc: Vec<u8>,
-    }
-
-    impl WebsocketHandler {
-        pub fn add_data(&mut self, data: &mut [u8]) -> Vec<String> {
-            let mut processed_offset = 0;
-            let mut strs = vec![];
-            let data_len = data.len();
-            loop {
-                let unprocessed_part_of_buf = &mut data[processed_offset..data_len];
-                let ret = self
-                    .frame_decoder
-                    .add_data(unprocessed_part_of_buf)
-                    .unwrap();
-                processed_offset += ret.consumed_bytes;
-
-                if ret.event.is_none() && ret.consumed_bytes == 0 {
-                    info!("consumed {processed_offset} bytes");
-                    return strs;
-                }
-
-                match ret.event {
-                    Some(Start {
-                        original_opcode: Opcode::Text,
-                        frame_info,
-                    }) => {
-                        info!("frame start at {processed_offset}");
-                        self.str_acc.clear();
-                        assert!(frame_info.is_reasonable());
-                    }
-                    Some(Start {
-                        original_opcode: Opcode::ConnectionClose,
-                        frame_info,
-                    }) => {
-                        info!(
-                            "received connection closed frame (start). frame_info: {frame_info:?}"
-                        );
-                        assert!(frame_info.is_reasonable());
-                    }
-                    Some(Start {
-                        original_opcode,
-                        frame_info,
-                    }) => {
-                        info!("frame start {:?}", original_opcode);
-                        assert!(frame_info.is_reasonable());
-                    }
-                    Some(PayloadChunk {
-                        original_opcode: Opcode::Text,
-                    }) => {
-                        info!("frame text payload_chunk: {} bytes", ret.consumed_bytes);
-                        self.str_acc
-                            .extend_from_slice(&unprocessed_part_of_buf[0..ret.consumed_bytes]);
-                    }
-                    Some(End {
-                        frame_info: FrameInfo { fin: true, .. },
-                        original_opcode: Opcode::Text,
-                    }) => {
-                        let s = String::from_utf8_lossy(&self.str_acc).to_string();
-                        info!("frame text end at {processed_offset}. msg={s}");
-                        strs.push(s);
-                    }
-                    Some(End {
-                        frame_info,
-                        original_opcode: Opcode::ConnectionClose,
-                    }) => {
-                        assert!(frame_info.is_reasonable());
-                        panic!(
-                            "received connection closed frame (end). frame_info: {frame_info:?}"
-                        );
-                    }
-                    Some(End {
-                        frame_info: FrameInfo { fin: true, .. },
-                        original_opcode,
-                    }) => {
-                        info!("frame end {:?}", original_opcode);
-                    }
-                    _ => continue,
-                }
-            }
-        }
-    }
 }
