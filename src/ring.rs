@@ -1,5 +1,4 @@
 use std::{
-    mem::MaybeUninit,
     ops::DerefMut,
     ptr,
     sync::atomic::{self, AtomicU32},
@@ -7,22 +6,9 @@ use std::{
 
 use log::info;
 
-use crate::{sys as libc, RING_POOL_SIZE};
+use crate::{read_buf::KernelBuffer, sys as libc, RING_POOL_SIZE};
 
-pub struct ReadBuf {
-    addr: *const u8,
-    bid: u16,
-    len: u32,
-}
-
-impl ReadBuf {
-    // TODO: mabe a ReadMutBuf variant is better
-    pub unsafe fn data_mut(&self, data_len: usize) -> &mut [u8] {
-        std::slice::from_raw_parts_mut(self.addr as *mut u8, data_len)
-    }
-}
-
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub struct Ring {
     pub(crate) ring_ptr: *mut libc::io_uring,
     pub(crate) buf_ring: *mut libc::io_uring_buf_ring,
@@ -33,29 +19,13 @@ impl Ring {
         io_uring_get_sqe(self.ring_ref_mut())
     }
 
-    pub unsafe fn get_read_buf(&mut self, buffer_id: u16) -> ReadBuf {
+    pub unsafe fn get_read_buf(&mut self, buffer_id: u16, data_len: usize) -> KernelBuffer {
         //log::info!("try get_read_buf {buffer_id}");
-        //let data_buf = std::ptr::addr_of_mut!(self.buf_ring_ref_mut().__bindgen_anon_1.bufs)
-        //    .add(buffer_id as usize)
-        //    .cast::<libc::io_uring_buf>();
-        //debug_assert!(!data_buf.is_null());
-        //let data_buf = &*data_buf;
-
-        let bufs = unsafe {
-            std::slice::from_raw_parts_mut(
-                std::ptr::addr_of_mut!(self.buf_ring_ref_mut().__bindgen_anon_1.bufs)
-                    .cast::<MaybeUninit<libc::io_uring_buf>>(),
-                RING_POOL_SIZE as _,
-            )
-        };
-        //for i in 0..bufs.len() {
-        //    let buf = &mut bufs[i];
-        //    let buf_addr = (buf as *mut _) as usize;
-        //    let buf = unsafe { (&mut *buf).assume_init() };
-        //    println!("{:?} {}", buf, buf_addr as usize);
-        //}
-
-        let data_buf = &mut bufs[buffer_id as usize].assume_init();
+        let data_buf = std::ptr::addr_of_mut!(self.buf_ring_ref_mut().__bindgen_anon_1.bufs)
+            .cast::<libc::io_uring_buf>()
+            .add(buffer_id as usize);
+        debug_assert!(!data_buf.is_null());
+        let data_buf = &*data_buf;
 
         debug_assert_eq!(
             data_buf.bid,
@@ -63,19 +33,24 @@ impl Ring {
             "addr: {}",
             (data_buf as *const _) as usize
         );
-        ReadBuf {
+        debug_assert!(data_buf.len >= data_len as u32);
+        KernelBuffer {
             addr: data_buf.addr as *const u8,
             bid: data_buf.bid,
-            len: data_buf.len,
+            buf_len: data_buf.len,
+            data_len,
         }
     }
 
-    pub unsafe fn buf_ring_add_advance(&mut self, read_buf: ReadBuf) {
-        let ReadBuf { addr, bid, len } = read_buf;
+    pub unsafe fn buf_ring_add_advance(&mut self, read_buf: KernelBuffer) {
+        log::info!("return ownership of buffer_{} to kernal", read_buf.bid);
+        let KernelBuffer {
+            addr, bid, buf_len, ..
+        } = read_buf;
         io_uring_buf_ring_add(
             self.buf_ring_ref_mut(),
             addr,
-            len,
+            buf_len,
             bid,
             io_uring_buf_ring_mask(RING_POOL_SIZE) as _,
             0,

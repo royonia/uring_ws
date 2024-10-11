@@ -1,4 +1,6 @@
+use crate::read_buf::KernelBufferVecReader;
 use crate::ring::Ring;
+use crate::RING_POOL_SIZE;
 use crate::{
     sys as libc,
     Event::{self, *},
@@ -11,7 +13,8 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicU32;
 
 pub struct TcpStream {
-    inner: Cursor<Vec<u8>>,
+    //inner: Cursor<Vec<u8>>,
+    inner: KernelBufferVecReader,
     ring: Ring,
     // rings related
     owner_id: u16,
@@ -27,9 +30,10 @@ pub struct TcpStream {
 
 impl TcpStream {
     pub fn new_from_std(raw: std::net::TcpStream, ring: Ring, owner_id: u16) -> Self {
-        let inner_buf_size = (BUF_SIZE * 4) as usize;
+        let inner_buf_size = RING_POOL_SIZE as usize;
         Self {
-            inner: Cursor::new(Vec::with_capacity(inner_buf_size)),
+            inner: KernelBufferVecReader::new(ring, inner_buf_size),
+            //inner: Cursor::new(vec![]),
             ring,
             owner_id,
             multishort_recv_id: 1201,
@@ -66,6 +70,9 @@ impl TcpStream {
                 assert!(cqe.res != 0);
                 assert!(cqe.flags & libc::IORING_CQE_F_BUFFER != 0);
 
+                // data_len does NOT equal to buffer_len
+                // buffer_len is always determined when first added to kernel ring
+                // data_len is returned from cqe op result, e.g. how many bytes read/written
                 let data_len = cqe.res as usize;
                 assert!(data_len > 0);
 
@@ -73,16 +80,18 @@ impl TcpStream {
 
                 let buffer_id = (cqe.flags >> libc::IORING_CQE_BUFFER_SHIFT) as u16;
 
-                let read_buf = self.ring.get_read_buf(buffer_id);
+                let read_buf = self.ring.get_read_buf(buffer_id, data_len);
                 // we are getting the exact buffer data
-                let data = read_buf.data_mut(data_len);
+                //let data = read_buf.data_mut(data_len);
+                //self.inner.get_mut().extend_from_slice(data);
+                //self.ring.buf_ring_add_advance(read_buf);
 
                 // append to inner
-                self.inner.get_mut().extend_from_slice(&data[..]);
+                self.inner.push(read_buf);
+
                 //log::info!("_on_cqe read data: {:?}", self.inner);
 
                 // yield back buffer to kernal
-                self.ring.buf_ring_add_advance(read_buf);
             }
         };
         Ok(())

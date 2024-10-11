@@ -137,7 +137,7 @@ pub fn probe_sys_uring() {
             let os_err = std::io::Error::last_os_error();
             panic!("{os_err}");
         } else if rval > 0 {
-            log::info!("submitted {rval} entries");
+            log::trace!("submitted {rval} entries");
         }
         // TODO: this need to be replaced by somewhat a variant of `static int _io_uring_get_cqe`
         // busy polling the cqe is bad
@@ -159,7 +159,6 @@ pub fn probe_sys_uring() {
                 match ws.get_mut() {
                     tungstenite::stream::MaybeTlsStream::NativeTls(s) => {
                         let stream = s.get_mut();
-                        //let stream = &mut s.sock;
                         unsafe { stream._on_cqe(cqe).unwrap() };
 
                         let handler = handlers.get_mut(user_data.owner() as usize).unwrap();
