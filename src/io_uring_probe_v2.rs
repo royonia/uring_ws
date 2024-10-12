@@ -1,7 +1,9 @@
 use log::info;
 use tungstenite::protocol::WebSocketContext;
 
-use crate::ring::{io_uring_buf_ring_add, Ring};
+use crate::cqe::Completion;
+use crate::read_buf::KernelBuffer;
+use crate::ring::{io_uring_buf_ring_add, io_uring_buf_ring_advance, Ring};
 use crate::sys::{self as libc};
 use crate::{op::*, Event, UserData};
 use crate::{BGID, BUF_SIZE, RING_POOL_SIZE};
@@ -27,6 +29,9 @@ pub fn probe_sys_uring() {
     let mut params: libc::io_uring_params = unsafe { std::mem::zeroed() };
     params.flags = libc::IORING_SETUP_SUBMIT_ALL;
     params.flags |= libc::IORING_SETUP_SQPOLL;
+    //params.flags |= libc::IORING_SETUP_IOPOLL;
+    //params.flags |= libc::IORING_SETUP_DEFER_TASKRUN;
+    //params.flags |= libc::IORING_RECVSEND_POLL_FIRST;
     // if not then set IORING_SETUP_COOP_TASKRUN
     params.flags |= libc::IORING_SETUP_SINGLE_ISSUER;
 
@@ -94,7 +99,7 @@ pub fn probe_sys_uring() {
         let buf = &mut bufs[i];
         let buf_addr = (buf as *mut _) as usize;
         let buf = unsafe { (&mut *buf).assume_init() };
-        println!("{:?} {}", buf, buf_addr as usize);
+        log::info!("{:?} {}", buf, buf_addr as usize);
     }
 
     // real logic goes here
@@ -102,8 +107,9 @@ pub fn probe_sys_uring() {
     // prep read
     let mut handlers = vec![];
     let mut streams = vec![];
-    for _ in 0..1 {
-        let (fd, ws) = init_tcp_stream(_ring.clone());
+    for owner_id in 0..3 {
+        let recv_id = (owner_id + 1200) as u32;
+        let (fd, ws) = init_tcp_stream(_ring.clone(), owner_id, recv_id);
         let handler =
             WebSocketContext::new(tungstenite::protocol::Role::Client, Default::default());
         handlers.push(handler);
@@ -113,13 +119,14 @@ pub fn probe_sys_uring() {
         //read_at(unsafe { &mut *sqe }, fd, ptr::null_mut(), buf_size, 0);
 
         let sqe = io_uring_get_sqe(&mut ring).unwrap();
-        let user_data = UserData::from_parts(Event::MultishortRecv as _, 0, 1201);
+        let user_data = UserData::from_parts(Event::MultishortRecv as _, owner_id, recv_id);
         unsafe { (&mut *sqe).user_data = user_data.as_u64() };
         //recv(unsafe { &mut *sqe }, fd, ptr::null_mut(), 0, 0);
         multishot_recv(unsafe { &mut *sqe }, fd, 0, BGID);
     }
 
     let cqe_buf = [const { MaybeUninit::<libc::io_uring_cqe>::uninit() }; 10];
+
     // NOTE: assume_init is not stable as a const fn yet
     let mut cqe_buf = cqe_buf
         .into_iter()
@@ -142,56 +149,57 @@ pub fn probe_sys_uring() {
         // TODO: this need to be replaced by somewhat a variant of `static int _io_uring_get_cqe`
         // busy polling the cqe is bad
         let rval = unsafe { libc::io_uring_peek_batch_cqe(&mut ring, cqe_buf.as_mut_ptr(), 10) };
+        let to_ready = if rval == 0 {
+            // if no immediate cqes then wait for the first one
+            let ret = unsafe {
+                libc::io_uring_wait_cqes(
+                    &mut ring,
+                    cqe_buf.as_mut_ptr(),
+                    1,
+                    ptr::null_mut() as _,
+                    ptr::null_mut() as _,
+                )
+            };
+            if ret < 0 {
+                let os_err = std::io::Error::last_os_error();
+                panic!("{os_err}");
+            }
+            1
+        } else {
+            rval
+        };
         //println!("io_uring_peek_batch_cqe returned {rval} io completion(s) filled");
 
-        for cqe_idx in 0..rval {
+        // cqe
+        for cqe_idx in 0..to_ready {
             let cqe = cqe_buf[cqe_idx as usize];
-            let cqe = unsafe { &mut *cqe };
-            if cqe.res < 0 {
-                let os_err = std::io::Error::from_raw_os_error(cqe.res.abs());
-                panic!("cqe error: {os_err}");
-            } else {
-                assert!(cqe.res > 0);
-                //let decoded = String::from_utf8_lossy(data);
-                // decode ssl
-                let user_data = UserData::from_packed(cqe.user_data);
-                let ws = streams.get_mut(user_data.owner() as usize).unwrap();
-                match ws.get_mut() {
-                    tungstenite::stream::MaybeTlsStream::NativeTls(s) => {
-                        let stream = s.get_mut();
-                        unsafe { stream._on_cqe(cqe).unwrap() };
+            let completion = unsafe { Completion::from_raw_ptr(&_ring, cqe) };
 
-                        let handler = handlers.get_mut(user_data.owner() as usize).unwrap();
-                        match handler.read_message_frame(s) {
-                            Ok(Some(msg)) => log::info!("{msg}"),
-                            Ok(None) => (),
-                            Err(tungstenite::Error::Io(io_err)) => {
-                                if io_err.kind() == io::ErrorKind::WouldBlock {
-                                    // not enough data to complete a frame read
-                                }
+            let stream_id = completion.user_data.owner();
+            let ws = streams.get_mut(stream_id as usize).unwrap();
+            match ws.get_mut() {
+                tungstenite::stream::MaybeTlsStream::NativeTls(s) => {
+                    let stream = s.get_mut();
+                    unsafe { stream.on_completion(completion).unwrap() };
+
+                    let handler = handlers.get_mut(stream_id as usize).unwrap();
+                    match handler.read_message_frame(s) {
+                        Ok(Some(msg)) => log::info!("{msg}"),
+                        Ok(None) => (),
+                        Err(tungstenite::Error::Io(io_err)) => {
+                            if io_err.kind() == io::ErrorKind::WouldBlock {
+                                // not enough data to complete a frame read
                             }
-                            Err(err) => panic!("{err}"),
-                        };
-                    }
-                    tungstenite::stream::MaybeTlsStream::Plain(s) => {
-                        todo!()
-                    }
-                    _ => unimplemented!(),
+                        }
+                        Err(err) => panic!("{err}"),
+                    };
                 }
+                tungstenite::stream::MaybeTlsStream::Plain(s) => {
+                    todo!()
+                }
+                _ => unimplemented!(),
             }
 
-            // yield back the buffer ownership to kernal
-            // atomic::compiler_fence(atomic::Ordering::Release);
-            //unsafe {
-            //    io_uring_buf_ring_add(
-            //        buf_ring,
-            //        buf.addr as _,
-            //        buf_size,
-            //        buffer_id as _,
-            //        io_uring_buf_ring_mask(pool_size) as _,
-            //        0,
-            //    )
-            //};
             //unsafe { io_uring_buf_ring_advance(buf_ring, 1 as _) };
             unsafe { io_uring_cq_advance(&mut ring, 1) };
         }
@@ -243,12 +251,6 @@ unsafe fn io_uring_initialize_sqe(sqe: &mut libc::io_uring_sqe) {
 unsafe fn io_uring_cq_advance(ring: &mut libc::io_uring, nr: u32) {
     let kernal_head = atomic::AtomicU32::from_ptr(ring.cq.khead);
     kernal_head.fetch_add(nr, atomic::Ordering::Release);
-}
-
-unsafe fn io_uring_buf_ring_advance(br: &mut libc::io_uring_buf_ring, count: u16) {
-    let tail_addr = ptr::addr_of!((&mut br.__bindgen_anon_1.__bindgen_anon_1).tail) as *mut _;
-    let tail = atomic::AtomicU16::from_ptr(tail_addr);
-    tail.fetch_add(count, atomic::Ordering::Release);
 }
 
 fn io_uring_buf_ring_mask(ring_entries: u16) -> u16 {
@@ -310,11 +312,12 @@ fn page_size() -> usize {
 }
 
 /// using tungstenite here is absolutely overkill
-/// what we want is an easy way to perform websocket upgrade and handshake
-/// having tungstenite WebSocket stream however is useful when we don't care to pay some cost of
-/// syscall for sending message to websocket directly
+/// what we want from it is an easy way to perform ssl handshake and websocket upgrade
+/// we also take the websocket frame decoder
 fn init_tcp_stream(
     ring: Ring,
+    owner_id: u16,
+    multishot_recv_id: u32,
 ) -> (
     RawFd,
     tungstenite::WebSocket<tungstenite::stream::MaybeTlsStream<crate::net::TcpStream>>,
@@ -335,7 +338,7 @@ fn init_tcp_stream(
     let (mut ws, response) = client_tls_with_config(
         "wss://ws.okx.com:8443/ws/v5/public",
         //tcp_stream,
-        crate::net::TcpStream::new_from_std(tcp_stream, ring, 0),
+        crate::net::TcpStream::new_from_std(tcp_stream, ring, owner_id, multishot_recv_id),
         Default::default(),
         None,
     )

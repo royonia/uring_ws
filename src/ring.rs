@@ -19,20 +19,48 @@ impl Ring {
         io_uring_get_sqe(self.ring_ref_mut())
     }
 
-    pub unsafe fn get_read_buf(&mut self, buffer_id: u16, data_len: usize) -> KernelBuffer {
-        //log::info!("try get_read_buf {buffer_id}");
-        let data_buf = std::ptr::addr_of_mut!(self.buf_ring_ref_mut().__bindgen_anon_1.bufs)
+    pub unsafe fn get_read_buf(&self, buffer_id: u16, data_len: usize) -> KernelBuffer {
+        log::info!(
+            "try get_read_buf {buffer_id}. tail = {}",
+            self.buf_ring_ref().__bindgen_anon_1.__bindgen_anon_1.tail
+        );
+        let data_buf = std::ptr::addr_of!(self.buf_ring_ref().__bindgen_anon_1.bufs)
             .cast::<libc::io_uring_buf>()
             .add(buffer_id as usize);
         debug_assert!(!data_buf.is_null());
         let data_buf = &*data_buf;
 
-        debug_assert_eq!(
-            data_buf.bid,
-            buffer_id,
-            "addr: {}",
-            (data_buf as *const _) as usize
-        );
+        if buffer_id != data_buf.bid {
+            let bufs = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::addr_of!(self.buf_ring_ref().__bindgen_anon_1.bufs)
+                        .cast::<libc::io_uring_buf>(),
+                    RING_POOL_SIZE as usize,
+                )
+            };
+            for i in 0..bufs.len() {
+                let buf = &bufs[i];
+                let buf_addr = (buf as *const _) as usize;
+                log::info!("[{i}] {:?} {}", buf, buf_addr as usize);
+            }
+
+            log::error!(
+                "expecting {}, got {}. \n
+                data_buf_ptr: {}\n
+                data_buf_addr: {}\n 
+                bufs_ptr: {}\n
+                tail: {}\n",
+                buffer_id,
+                data_buf.bid,
+                (data_buf as *const _) as usize,
+                data_buf.addr,
+                std::ptr::addr_of!(self.buf_ring_ref().__bindgen_anon_1.bufs)
+                    .cast::<libc::io_uring_buf>() as usize,
+                self.buf_ring_ref().__bindgen_anon_1.__bindgen_anon_1.tail,
+            );
+            panic!();
+        }
+
         debug_assert!(data_buf.len >= data_len as u32);
         KernelBuffer {
             addr: data_buf.addr as *const u8,
@@ -43,7 +71,11 @@ impl Ring {
     }
 
     pub unsafe fn buf_ring_add_advance(&mut self, read_buf: KernelBuffer) {
-        log::info!("return ownership of buffer_{} to kernal", read_buf.bid);
+        log::info!(
+            "completion return ownership of buffer_{} to kernal",
+            read_buf.bid
+        );
+
         let KernelBuffer {
             addr, bid, buf_len, ..
         } = read_buf;
@@ -113,7 +145,8 @@ pub(crate) unsafe fn io_uring_buf_ring_add(
     buf_offset: u32,
 ) {
     //struct io_uring_buf *buf = &br->bufs[(br->tail + buf_offset) & mask];
-    let tail = br.__bindgen_anon_1.__bindgen_anon_1.tail as u32;
+    let tail_addr = ptr::addr_of!((&mut br.__bindgen_anon_1.__bindgen_anon_1).tail) as *mut _;
+    let tail = atomic::AtomicU16::from_ptr(tail_addr).load(atomic::Ordering::Acquire) as u32;
     let idx = (tail + buf_offset) & mask;
     let idx = idx as usize;
     let offset = size_of::<libc::io_uring_buf>();
@@ -137,7 +170,7 @@ fn io_uring_buf_ring_mask(ring_entries: u16) -> u16 {
     ring_entries - 1
 }
 
-unsafe fn io_uring_buf_ring_advance(br: &mut libc::io_uring_buf_ring, count: u16) {
+pub(crate) unsafe fn io_uring_buf_ring_advance(br: &mut libc::io_uring_buf_ring, count: u16) {
     let tail_addr = ptr::addr_of!((&mut br.__bindgen_anon_1.__bindgen_anon_1).tail) as *mut _;
     let tail = atomic::AtomicU16::from_ptr(tail_addr);
     tail.fetch_add(count, atomic::Ordering::Release);

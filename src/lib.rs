@@ -1,3 +1,4 @@
+mod cqe;
 mod net;
 mod op;
 mod read_buf;

@@ -1,3 +1,4 @@
+use crate::cqe::Completion;
 use crate::read_buf::KernelBufferVecReader;
 use crate::ring::Ring;
 use crate::RING_POOL_SIZE;
@@ -29,14 +30,14 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    pub fn new_from_std(raw: std::net::TcpStream, ring: Ring, owner_id: u16) -> Self {
+    pub fn new_from_std(raw: std::net::TcpStream, ring: Ring, owner_id: u16, recv_id: u32) -> Self {
         let inner_buf_size = RING_POOL_SIZE as usize;
         Self {
             inner: KernelBufferVecReader::new(ring, inner_buf_size),
             //inner: Cursor::new(vec![]),
             ring,
             owner_id,
-            multishort_recv_id: 1201,
+            multishort_recv_id: recv_id,
             send_id: AtomicU32::new(0),
             pending_sent: Default::default(),
             nonblocking: false,
@@ -45,47 +46,42 @@ impl TcpStream {
         }
     }
 
-    pub unsafe fn _on_cqe(&mut self, cqe: &libc::io_uring_cqe) -> Result<(), io::Error> {
-        let user_data = UserData::from_packed(cqe.user_data);
+    /// take ownership of an completion event
+    /// a completion is event is supposed to be handled by ONE owner only assigned by owner_id
+    /// double consuming a completion event is unsafe because one might consume and mutate the
+    /// content of the assigned kernel buffer
+    /// and nothing stop one from returning the ownership of a kernel buffer back to kernel
+    /// that we should avoid any handlers that sniffed the completion event and try to consume the
+    /// kernel buffer
+    pub unsafe fn on_completion(&mut self, mut completion: Completion) -> Result<(), io::Error> {
+        let user_data = completion.user_data;
         if user_data.owner() != self.owner_id {
             return Ok(());
         }
 
         match Event::from_u8(user_data.event()) {
             Send => {
-                assert!(cqe.res != 0);
+                assert!(completion.raw_cqe().res != 0);
 
                 let pending = self.pending_sent.get(&user_data).unwrap();
-                assert_eq!(pending.len(), cqe.res as usize);
+                assert_eq!(pending.len(), completion.raw_cqe().res as usize);
             }
             MultishortRecv => {
+                assert_eq!(user_data.req(), self.multishort_recv_id);
                 log::info!(
                     "_on_cqe: req: {}, event: {}, res: {}",
                     user_data.req(),
                     user_data.event(),
-                    cqe.res,
+                    completion.raw_cqe().res,
                 );
                 // using the entire user_data just for sqe_id is rather a waste
                 assert_eq!(user_data.req(), self.multishort_recv_id);
-                assert!(cqe.res != 0);
-                assert!(cqe.flags & libc::IORING_CQE_F_BUFFER != 0);
+                assert!(completion.raw_cqe().res != 0);
+                assert!(completion.raw_cqe().flags & libc::IORING_CQE_F_BUFFER != 0);
 
-                // data_len does NOT equal to buffer_len
-                // buffer_len is always determined when first added to kernel ring
-                // data_len is returned from cqe op result, e.g. how many bytes read/written
-                let data_len = cqe.res as usize;
-                assert!(data_len > 0);
-
-                // get buffer data
-
-                let buffer_id = (cqe.flags >> libc::IORING_CQE_BUFFER_SHIFT) as u16;
-
-                let read_buf = self.ring.get_read_buf(buffer_id, data_len);
-                // we are getting the exact buffer data
-                //let data = read_buf.data_mut(data_len);
-                //self.inner.get_mut().extend_from_slice(data);
-                //self.ring.buf_ring_add_advance(read_buf);
-
+                let read_buf = completion
+                    .take_kernel_buf()
+                    .expect("already asserted that kernel buff must exist");
                 // append to inner
                 self.inner.push(read_buf);
 

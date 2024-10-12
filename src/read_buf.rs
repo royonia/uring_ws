@@ -98,9 +98,9 @@ impl Read for KernelBufferReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         assert!(self.remaining() > 0);
         //let claimed = self.buf_ref().data(self.claimed()).read(buf)?;
-        let data = self.buf_ref().data(0);
+        let mut data = self.buf_ref().data(self.claimed());
         //log::info!("{data:?}");
-        let claimed = (&data[self.claimed()..]).read(buf)?;
+        let claimed = data.read(buf)?;
         self.commit(claimed);
         log::trace!("buf[{}] claimed {} bytes", self.buf_ref().bid, claimed);
         assert!(self.claimed() <= self.buf_ref().data_len());
@@ -137,9 +137,11 @@ impl Read for KernelBufferVecReader {
         if let Some(v) = self.buf_vec.get_mut(0) {
             assert!(v.remaining() > 0);
 
-            claimed += v.read(buf)?;
+            while v.remaining() > 0 {
+                claimed += v.read(buf)?;
 
-            drained = v.remaining() == 0;
+                drained = v.remaining() == 0;
+            }
         }
 
         if drained {
