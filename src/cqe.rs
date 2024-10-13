@@ -40,7 +40,7 @@ impl Completion {
 
             log::info!("[{}] completion require {}", user_data.owner(), buffer_id);
 
-            let kernel_buf = ring.get_read_buf(buffer_id, data_len);
+            let kernel_buf = ring.get_read_buf(user_data.owner(), buffer_id, data_len);
             assert_eq!(kernel_buf.bid, buffer_id);
             Some(kernel_buf)
         } else {

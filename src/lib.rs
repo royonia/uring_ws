@@ -1,3 +1,4 @@
+mod common;
 mod cqe;
 mod net;
 mod op;
@@ -8,12 +9,19 @@ mod sys;
 pub mod io_uring_probe;
 pub mod io_uring_probe_v2;
 
+pub type OwnID = u16;
+pub type BufferGroupID = u16;
+
+pub const MAX_BUFFER_GROUP: usize = 256;
+
 /// we might actually want a buffer group per connection?
 pub const BGID: u16 = 0;
 /// large enough to fit one datagram
 pub const BUF_SIZE: u32 = 1500;
 /// rather random. increase if sqe submission are backpressured
 pub const RING_POOL_SIZE: u16 = 2u16.pow(6);
+
+pub const CQE_WAIT_NR: u32 = 1;
 
 #[repr(u8)]
 enum Event {

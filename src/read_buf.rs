@@ -1,10 +1,11 @@
 use std::{collections::VecDeque, io::Read};
 
-use crate::ring::Ring;
+use crate::ring::{Ring, SharedRing};
 
 pub struct KernelBuffer {
     pub addr: *const u8,
     pub bid: u16,
+    pub bgid: u16,
     pub data_len: usize,
     pub buf_len: u32,
 }
@@ -44,13 +45,13 @@ macro_rules! unwrap_mut {
 }
 
 pub struct KernelBufferReader {
-    ring: Ring,
+    ring: SharedRing,
     buf: Option<KernelBuffer>,
     claimed: usize,
 }
 
 impl KernelBufferReader {
-    pub fn new(ring: Ring, buf: KernelBuffer) -> Self {
+    pub fn new(ring: SharedRing, buf: KernelBuffer) -> Self {
         Self {
             ring,
             buf: Some(buf),
@@ -90,7 +91,7 @@ impl Drop for KernelBufferReader {
             .buf
             .take()
             .expect("buf must not be none before dropping");
-        unsafe { self.ring.buf_ring_add_advance(buf) };
+        unsafe { self.ring.borrow_mut().buf_ring_add_advance(buf) };
     }
 }
 
@@ -109,12 +110,12 @@ impl Read for KernelBufferReader {
 }
 
 pub struct KernelBufferVecReader {
-    ring: Ring,
+    ring: SharedRing,
     buf_vec: VecDeque<KernelBufferReader>,
 }
 
 impl KernelBufferVecReader {
-    pub fn new(ring: Ring, capacity: usize) -> Self {
+    pub fn new(ring: SharedRing, capacity: usize) -> Self {
         Self {
             ring,
             buf_vec: VecDeque::with_capacity(capacity),
@@ -122,7 +123,7 @@ impl KernelBufferVecReader {
     }
     pub fn push(&mut self, buf: KernelBuffer) {
         self.buf_vec
-            .push_back(KernelBufferReader::new(self.ring, buf));
+            .push_back(KernelBufferReader::new(self.ring.clone(), buf));
         assert!(
             self.buf_vec.len() <= self.buf_vec.capacity(),
             "must not reallocate"
@@ -137,11 +138,13 @@ impl Read for KernelBufferVecReader {
         if let Some(v) = self.buf_vec.get_mut(0) {
             assert!(v.remaining() > 0);
 
-            while v.remaining() > 0 {
-                claimed += v.read(buf)?;
+            //while v.remaining() > 0 {
+            let bytes = v.read(&mut buf[claimed..])?;
+            assert!(bytes > 0, "buf_len = {}", buf.len());
+            claimed += bytes;
 
-                drained = v.remaining() == 0;
-            }
+            drained = v.remaining() == 0;
+            //}
         }
 
         if drained {

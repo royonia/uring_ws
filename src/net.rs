@@ -1,6 +1,6 @@
 use crate::cqe::Completion;
 use crate::read_buf::KernelBufferVecReader;
-use crate::ring::Ring;
+use crate::ring::{Ring, SharedRing};
 use crate::RING_POOL_SIZE;
 use crate::{
     sys as libc,
@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicU32;
 pub struct TcpStream {
     //inner: Cursor<Vec<u8>>,
     inner: KernelBufferVecReader,
-    ring: Ring,
+    ring: SharedRing,
     // rings related
     owner_id: u16,
     multishort_recv_id: u32,
@@ -30,10 +30,15 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
-    pub fn new_from_std(raw: std::net::TcpStream, ring: Ring, owner_id: u16, recv_id: u32) -> Self {
+    pub fn new_from_std(
+        raw: std::net::TcpStream,
+        ring: SharedRing,
+        owner_id: u16,
+        recv_id: u32,
+    ) -> Self {
         let inner_buf_size = RING_POOL_SIZE as usize;
         Self {
-            inner: KernelBufferVecReader::new(ring, inner_buf_size),
+            inner: KernelBufferVecReader::new(ring.clone(), inner_buf_size),
             //inner: Cursor::new(vec![]),
             ring,
             owner_id,
@@ -113,12 +118,12 @@ impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.nonblocking {
             let len = self.inner.read(buf)?;
+            log::info!("attempted cursor read {} bytes.", len);
             if len == 0 {
                 Err(io::ErrorKind::WouldBlock.into())
             } else {
                 Ok(len)
             }
-            //log::info!("attempted cursor read {} bytes.", len);
         } else {
             self.raw.read(buf)
         }

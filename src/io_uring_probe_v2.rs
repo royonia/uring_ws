@@ -2,11 +2,9 @@ use log::info;
 use tungstenite::protocol::WebSocketContext;
 
 use crate::cqe::Completion;
-use crate::read_buf::KernelBuffer;
-use crate::ring::{io_uring_buf_ring_add, io_uring_buf_ring_advance, Ring};
+use crate::ring::{Ring, SharedRing};
 use crate::sys::{self as libc};
-use crate::{op::*, Event, UserData};
-use crate::{BGID, BUF_SIZE, RING_POOL_SIZE};
+use crate::{op::*, Event, UserData, CQE_WAIT_NR, MAX_BUFFER_GROUP};
 use core::panic;
 use std::io;
 use std::{
@@ -25,10 +23,17 @@ pub fn probe_sys_uring() {
     let mut ring = MaybeUninit::uninit();
     let ring_ptr: *mut libc::io_uring = ring.as_mut_ptr();
 
+    // ring wrapper instance
+    let _ring = Ring {
+        ring_ptr,
+        buf_ring_ptrs: [unsafe { const { std::mem::zeroed() } }; MAX_BUFFER_GROUP],
+    }
+    .into_shared();
+
     // using liburing here to greatly reduce io_uring setup boilerplate
     let mut params: libc::io_uring_params = unsafe { std::mem::zeroed() };
     params.flags = libc::IORING_SETUP_SUBMIT_ALL;
-    params.flags |= libc::IORING_SETUP_SQPOLL;
+    //params.flags |= libc::IORING_SETUP_SQPOLL;
     //params.flags |= libc::IORING_SETUP_IOPOLL;
     //params.flags |= libc::IORING_SETUP_DEFER_TASKRUN;
     //params.flags |= libc::IORING_RECVSEND_POLL_FIRST;
@@ -44,85 +49,30 @@ pub fn probe_sys_uring() {
 
     let mut ring = unsafe { ring.assume_init() };
 
-    // prep buffer ring
-    let pool_size = RING_POOL_SIZE;
-    let buf_size = BUF_SIZE;
-    let buf_ring =
-        unsafe { &mut *rust_io_uring_setup_buf_ring(&mut ring, pool_size, BGID).unwrap() };
-
-    // allocate the real buffer
-    // must be aligned
-    let bufs_layout = alloc_layout_buffers(pool_size, buf_size, page_size()).unwrap();
-    let bufs_addr = unsafe { std::alloc::alloc(bufs_layout) };
-    if bufs_addr.is_null() {
-        panic!("bufs_addr: out of memory");
-    }
-
-    let bufs = unsafe {
-        std::slice::from_raw_parts_mut(
-            std::ptr::addr_of_mut!(buf_ring.__bindgen_anon_1.bufs)
-                .cast::<MaybeUninit<libc::io_uring_buf>>(),
-            pool_size as usize,
-        )
-    };
-
-    // ring wrapper instance
-    let _ring = Ring { ring_ptr, buf_ring };
-
-    for (i, _) in bufs.iter_mut().enumerate() {
-        let addr = unsafe { bufs_addr.add(i * buf_size as usize) };
-        //ring_buf.write(libc::io_uring_buf {
-        //    addr: addr as u64,
-        //    len: buf_size,
-        //    bid: i as u16,
-        //    resv: 0,
-        //});
-        //
-        // this is essentially the same operation as writing directly into the ring_buf
-        // because `bufs` is simply an allocated buffer based at addr(buf_ring) of length pool_size
-        unsafe {
-            io_uring_buf_ring_add(
-                buf_ring,
-                addr as _,
-                buf_size,
-                i as u16,
-                io_uring_buf_ring_mask(pool_size).into(),
-                i as u32,
-            )
-        }
-    }
-    unsafe {
-        io_uring_buf_ring_advance(buf_ring, pool_size);
-    }
-
-    for i in 0..bufs.len() {
-        let buf = &mut bufs[i];
-        let buf_addr = (buf as *mut _) as usize;
-        let buf = unsafe { (&mut *buf).assume_init() };
-        log::info!("{:?} {}", buf, buf_addr as usize);
-    }
-
     // real logic goes here
 
     // prep read
     let mut handlers = vec![];
     let mut streams = vec![];
-    for owner_id in 0..3 {
+    for owner_id in 0..5 {
         let recv_id = (owner_id + 1200) as u32;
         let (fd, ws) = init_tcp_stream(_ring.clone(), owner_id, recv_id);
         let handler =
             WebSocketContext::new(tungstenite::protocol::Role::Client, Default::default());
         handlers.push(handler);
         streams.push(ws);
-        //let fd = stream.as_raw_fd();
 
-        //read_at(unsafe { &mut *sqe }, fd, ptr::null_mut(), buf_size, 0);
+        // init a new buffer group
+        let buffer_group_id = owner_id;
+        _ring
+            .borrow_mut()
+            .new_buffer_group(&mut ring, buffer_group_id);
 
         let sqe = io_uring_get_sqe(&mut ring).unwrap();
         let user_data = UserData::from_parts(Event::MultishortRecv as _, owner_id, recv_id);
         unsafe { (&mut *sqe).user_data = user_data.as_u64() };
         //recv(unsafe { &mut *sqe }, fd, ptr::null_mut(), 0, 0);
-        multishot_recv(unsafe { &mut *sqe }, fd, 0, BGID);
+        multishot_recv(unsafe { &mut *sqe }, fd, 0, buffer_group_id);
     }
 
     let cqe_buf = [const { MaybeUninit::<libc::io_uring_cqe>::uninit() }; 10];
@@ -155,7 +105,7 @@ pub fn probe_sys_uring() {
                 libc::io_uring_wait_cqes(
                     &mut ring,
                     cqe_buf.as_mut_ptr(),
-                    1,
+                    CQE_WAIT_NR,
                     ptr::null_mut() as _,
                     ptr::null_mut() as _,
                 )
@@ -173,7 +123,7 @@ pub fn probe_sys_uring() {
         // cqe
         for cqe_idx in 0..to_ready {
             let cqe = cqe_buf[cqe_idx as usize];
-            let completion = unsafe { Completion::from_raw_ptr(&_ring, cqe) };
+            let completion = unsafe { Completion::from_raw_ptr(&_ring.borrow(), cqe) };
 
             let stream_id = completion.user_data.owner();
             let ws = streams.get_mut(stream_id as usize).unwrap();
@@ -252,29 +202,6 @@ unsafe fn io_uring_cq_advance(ring: &mut libc::io_uring, nr: u32) {
     let kernal_head = atomic::AtomicU32::from_ptr(ring.cq.khead);
     kernal_head.fetch_add(nr, atomic::Ordering::Release);
 }
-
-fn io_uring_buf_ring_mask(ring_entries: u16) -> u16 {
-    ring_entries - 1
-}
-
-/// binding to liburing io_uring_setup_buf_ring
-/// https://man7.org/linux/man-pages/man3/io_uring_setup_buf_ring.3.html
-fn rust_io_uring_setup_buf_ring(
-    ring: *mut libc::io_uring,
-    nentries: u16,
-    bgid: u16,
-) -> Result<*mut libc::io_uring_buf_ring, std::io::Error> {
-    unsafe {
-        let mut ret = 0i32;
-        // flags is currently unused and must be set to zero.
-        let buf_ring = libc::io_uring_setup_buf_ring(ring, nentries as _, bgid as _, 0, &mut ret);
-        if buf_ring.is_null() {
-            return Err(std::io::Error::from_raw_os_error(ret));
-        }
-        Ok(&mut *buf_ring)
-    }
-}
-
 // normal syscalls
 
 fn open_unchecked(path: impl AsRef<str>) -> RawFd {
@@ -292,30 +219,11 @@ fn close(fd: RawFd) {
     unsafe { libc::close(fd as _) };
 }
 
-fn alloc_layout_buffers(
-    pool_size: u16,
-    buf_size: u32,
-    page_size: usize,
-) -> std::io::Result<std::alloc::Layout> {
-    match std::alloc::Layout::from_size_align(pool_size as usize * buf_size as usize, page_size) {
-        Ok(layout) => Ok(layout),
-        // This will only fail if the size is larger then roughly
-        // `isize::MAX - PAGE_SIZE`, which is a huge allocation.
-        Err(_) => Err(std::io::ErrorKind::OutOfMemory.into()),
-    }
-}
-
-/// Size of a single page, often 4096.
-#[allow(clippy::cast_sign_loss)] // Page size shouldn't be negative.
-fn page_size() -> usize {
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize }
-}
-
 /// using tungstenite here is absolutely overkill
 /// what we want from it is an easy way to perform ssl handshake and websocket upgrade
 /// we also take the websocket frame decoder
 fn init_tcp_stream(
-    ring: Ring,
+    ring: SharedRing,
     owner_id: u16,
     multishot_recv_id: u32,
 ) -> (
