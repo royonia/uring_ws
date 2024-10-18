@@ -1,14 +1,14 @@
 use crate::cqe::Completion;
 use crate::read_buf::KernelBufferVecReader;
-use crate::ring::{Ring, SharedRing};
+use crate::ring::SharedRing;
 use crate::RING_POOL_SIZE;
 use crate::{
     sys as libc,
     Event::{self, *},
-    UserData, BUF_SIZE,
+    UserData,
 };
 use std::collections::HashMap;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Read, Write};
 use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::AtomicU32;
@@ -38,7 +38,7 @@ impl TcpStream {
     ) -> Self {
         let inner_buf_size = RING_POOL_SIZE as usize;
         Self {
-            inner: KernelBufferVecReader::new(ring.clone(), inner_buf_size),
+            inner: KernelBufferVecReader::new(inner_buf_size),
             //inner: Cursor::new(vec![]),
             ring,
             owner_id,
@@ -60,16 +60,14 @@ impl TcpStream {
     /// kernel buffer
     pub unsafe fn on_completion(&mut self, mut completion: Completion) -> Result<(), io::Error> {
         let user_data = completion.user_data;
-        if user_data.owner() != self.owner_id {
-            return Ok(());
-        }
+        assert_eq!(user_data.owner(), self.owner_id);
 
         match Event::from_u8(user_data.event()) {
             Send => {
-                assert!(completion.raw_cqe().res != 0);
+                assert!(completion.as_cqe_ref().res != 0);
 
                 let pending = self.pending_sent.get(&user_data).unwrap();
-                assert_eq!(pending.len(), completion.raw_cqe().res as usize);
+                assert_eq!(pending.len(), completion.as_cqe_ref().res as usize);
             }
             MultishortRecv => {
                 assert_eq!(user_data.req(), self.multishort_recv_id);
@@ -77,12 +75,12 @@ impl TcpStream {
                     "_on_cqe: req: {}, event: {}, res: {}",
                     user_data.req(),
                     user_data.event(),
-                    completion.raw_cqe().res,
+                    completion.as_cqe_ref().res,
                 );
                 // using the entire user_data just for sqe_id is rather a waste
                 assert_eq!(user_data.req(), self.multishort_recv_id);
-                assert!(completion.raw_cqe().res != 0);
-                assert!(completion.raw_cqe().flags & libc::IORING_CQE_F_BUFFER != 0);
+                assert!(completion.as_cqe_ref().res != 0);
+                assert!(completion.as_cqe_ref().flags & libc::IORING_CQE_F_BUFFER != 0);
 
                 let read_buf = completion
                     .take_kernel_buf()

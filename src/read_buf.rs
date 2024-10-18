@@ -1,13 +1,25 @@
+use crate::{ring::buf_ring_add_advance, sys as libc};
 use std::{collections::VecDeque, io::Read};
 
-use crate::ring::{Ring, SharedRing};
+use crate::NonSendable;
 
 pub struct KernelBuffer {
+    /// pointer to the start of buffer data
     pub addr: *const u8,
-    pub bid: u16,
-    pub bgid: u16,
+    /// data length for read
     pub data_len: usize,
+    /// pointer to buf_ring
+    pub buf_ring: *mut libc::io_uring_buf_ring,
+    /// buffer id
+    pub bid: u16,
+    /// buffer group id
+    pub bgid: u16,
+    /// buffer length allocated
     pub buf_len: u32,
+    /// marker to make KernelBuffer is !Send and !Sync
+    /// KernelBuffer not thread safe because each kernel buffer return its ownership back to kernel
+    /// while dropping - this is not a thread safe operation
+    pub __nonsendable: NonSendable,
 }
 
 impl KernelBuffer {
@@ -18,16 +30,19 @@ impl KernelBuffer {
     fn data(&self, offset: usize) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self.addr.add(offset), self.data_len - offset) }
     }
-}
-
-impl KernelBuffer {
     // TODO: mabe a ReadMutBuf variant is better
     pub unsafe fn data_mut(&self, data_len: usize) -> &mut [u8] {
         std::slice::from_raw_parts_mut(self.addr as *mut u8, data_len)
     }
 }
 
-macro_rules! unwrap {
+impl Drop for KernelBuffer {
+    fn drop(&mut self) {
+        unsafe { buf_ring_add_advance(self) };
+    }
+}
+
+macro_rules! unwrap_option {
     ($op:expr) => {
         match &$op {
             Some(v) => v,
@@ -35,7 +50,7 @@ macro_rules! unwrap {
         }
     };
 }
-macro_rules! unwrap_mut {
+macro_rules! unwrap_option_mut {
     ($op:expr) => {
         match &mut $op {
             Some(v) => v,
@@ -45,15 +60,13 @@ macro_rules! unwrap_mut {
 }
 
 pub struct KernelBufferReader {
-    ring: SharedRing,
     buf: Option<KernelBuffer>,
     claimed: usize,
 }
 
 impl KernelBufferReader {
-    pub fn new(ring: SharedRing, buf: KernelBuffer) -> Self {
+    pub fn new(buf: KernelBuffer) -> Self {
         Self {
-            ring,
             buf: Some(buf),
             claimed: 0,
         }
@@ -77,12 +90,12 @@ impl KernelBufferReader {
 
     #[inline(always)]
     pub fn buf_ref_mut(&mut self) -> &mut KernelBuffer {
-        unwrap_mut!(self.buf)
+        unwrap_option_mut!(self.buf)
     }
 
     #[inline(always)]
     pub fn buf_ref(&self) -> &KernelBuffer {
-        unwrap!(self.buf)
+        unwrap_option!(self.buf)
     }
 }
 impl Drop for KernelBufferReader {
@@ -91,7 +104,7 @@ impl Drop for KernelBufferReader {
             .buf
             .take()
             .expect("buf must not be none before dropping");
-        unsafe { self.ring.borrow_mut().buf_ring_add_advance(buf) };
+        drop(buf);
     }
 }
 
@@ -110,20 +123,18 @@ impl Read for KernelBufferReader {
 }
 
 pub struct KernelBufferVecReader {
-    ring: SharedRing,
+    // TODO: replaced with a double ring buf
     buf_vec: VecDeque<KernelBufferReader>,
 }
 
 impl KernelBufferVecReader {
-    pub fn new(ring: SharedRing, capacity: usize) -> Self {
+    pub fn new(capacity: usize) -> Self {
         Self {
-            ring,
             buf_vec: VecDeque::with_capacity(capacity),
         }
     }
     pub fn push(&mut self, buf: KernelBuffer) {
-        self.buf_vec
-            .push_back(KernelBufferReader::new(self.ring.clone(), buf));
+        self.buf_vec.push_back(KernelBufferReader::new(buf));
         assert!(
             self.buf_vec.len() <= self.buf_vec.capacity(),
             "must not reallocate"

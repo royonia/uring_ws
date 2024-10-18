@@ -1,6 +1,6 @@
 use std::os::fd::RawFd;
 
-use crate::{sys as libc, BGID};
+use crate::sys as libc;
 
 fn read_at(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, offset: u64) {
     sqe.opcode = libc::IORING_OP_READ as u8;
@@ -9,8 +9,8 @@ fn read_at(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, offs
     sqe.__bindgen_anon_2 = libc::io_uring_sqe__bindgen_ty_2 { addr: ptr as _ };
     sqe.len = len;
     // buffer select
-    sqe.__bindgen_anon_4.buf_group = BGID as u16;
-    sqe.flags |= libc::IOSQE_BUFFER_SELECT;
+    //sqe.__bindgen_anon_4.buf_group = BGID as u16;
+    //sqe.flags |= libc::IOSQE_BUFFER_SELECT;
 }
 
 pub fn recv(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, flags: libc::c_int) {
@@ -22,8 +22,8 @@ pub fn recv(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, fla
     };
     sqe.len = len;
     // buffer select
-    sqe.__bindgen_anon_4.buf_group = BGID as u16;
-    sqe.flags |= libc::IOSQE_BUFFER_SELECT;
+    //sqe.__bindgen_anon_4.buf_group = BGID as u16;
+    //sqe.flags |= libc::IOSQE_BUFFER_SELECT;
 }
 
 /// Create a write submission starting at `offset`.

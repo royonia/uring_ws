@@ -2,7 +2,7 @@ use log::info;
 use tungstenite::protocol::WebSocketContext;
 
 use crate::cqe::Completion;
-use crate::ring::{Ring, SharedRing};
+use crate::ring::{BufRingPool, SharedRing};
 use crate::sys::{self as libc};
 use crate::{op::*, Event, UserData, CQE_WAIT_NR, MAX_BUFFER_GROUP};
 use core::panic;
@@ -24,8 +24,7 @@ pub fn probe_sys_uring() {
     let ring_ptr: *mut libc::io_uring = ring.as_mut_ptr();
 
     // ring wrapper instance
-    let _ring = Ring {
-        ring_ptr,
+    let _ring = BufRingPool {
         buf_ring_ptrs: [unsafe { const { std::mem::zeroed() } }; MAX_BUFFER_GROUP],
     }
     .into_shared();
@@ -35,10 +34,11 @@ pub fn probe_sys_uring() {
     params.flags = libc::IORING_SETUP_SUBMIT_ALL;
     //params.flags |= libc::IORING_SETUP_SQPOLL;
     //params.flags |= libc::IORING_SETUP_IOPOLL;
-    //params.flags |= libc::IORING_SETUP_DEFER_TASKRUN;
     //params.flags |= libc::IORING_RECVSEND_POLL_FIRST;
     // if not then set IORING_SETUP_COOP_TASKRUN
     params.flags |= libc::IORING_SETUP_SINGLE_ISSUER;
+    params.flags |= libc::IORING_SETUP_COOP_TASKRUN;
+    params.flags |= libc::IORING_SETUP_DEFER_TASKRUN;
 
     let rval = unsafe { libc::io_uring_queue_init_params(1024, ring_ptr, &mut params) };
     if rval != 0 {
@@ -96,8 +96,6 @@ pub fn probe_sys_uring() {
         } else if rval > 0 {
             log::trace!("submitted {rval} entries");
         }
-        // TODO: this need to be replaced by somewhat a variant of `static int _io_uring_get_cqe`
-        // busy polling the cqe is bad
         let rval = unsafe { libc::io_uring_peek_batch_cqe(&mut ring, cqe_buf.as_mut_ptr(), 10) };
         let to_ready = if rval == 0 {
             // if no immediate cqes then wait for the first one
@@ -123,7 +121,7 @@ pub fn probe_sys_uring() {
         // cqe
         for cqe_idx in 0..to_ready {
             let cqe = cqe_buf[cqe_idx as usize];
-            let completion = unsafe { Completion::from_raw_ptr(&_ring.borrow(), cqe) };
+            let completion = unsafe { Completion::from_raw_event(&mut _ring.borrow_mut(), cqe) };
 
             let stream_id = completion.user_data.owner();
             let ws = streams.get_mut(stream_id as usize).unwrap();
@@ -260,6 +258,26 @@ fn init_tcp_stream(
             {
               "channel": "books",
               "instId": "BTC-USDT"
+            },
+            {
+              "channel": "books",
+              "instId": "ETH-USDT"
+            },
+            {
+              "channel": "books",
+              "instId": "SOL-USDT"
+            },
+            {
+              "channel": "books",
+              "instId": "BTC-USDT-SWAP"
+            },
+            {
+              "channel": "books",
+              "instId": "ETH-USDT-SWAP"
+            },
+            {
+              "channel": "books",
+              "instId": "SOL-USDT-SWAP"
             }
           ]
         }

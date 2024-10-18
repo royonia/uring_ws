@@ -7,28 +7,25 @@ use std::{
     sync::atomic::{self, AtomicU32},
 };
 
-use log::{info, trace};
+use log::trace;
 
 use crate::{
-    common::*, read_buf::KernelBuffer, sys as libc, BufferGroupID, BUF_SIZE, MAX_BUFFER_GROUP,
-    RING_POOL_SIZE,
+    common::*, read_buf::KernelBuffer, sys as libc, BufferGroupID, NonSendable, BUF_SIZE,
+    MAX_BUFFER_GROUP, RING_POOL_SIZE,
 };
 
-pub type SharedRing = Rc<RefCell<Ring>>;
+pub type SharedRing = Rc<RefCell<BufRingPool>>;
 
-pub struct Ring {
-    pub(crate) ring_ptr: *mut libc::io_uring,
+pub struct BufRingPool {
     pub(crate) buf_ring_ptrs: [*mut libc::io_uring_buf_ring; MAX_BUFFER_GROUP],
 }
 
-impl Ring {
+impl BufRingPool {
     pub fn into_shared(self) -> SharedRing {
         Rc::new(RefCell::new(self))
     }
-    pub fn get_sqe(&mut self) -> Result<*mut libc::io_uring_sqe, &'static str> {
-        io_uring_get_sqe(self.ring_ref_mut())
-    }
 
+    // FIXME: we should definitely assert that buffer_group_id is not already occupied
     pub fn new_buffer_group(
         &mut self,
         ring: &mut libc::io_uring,
@@ -92,12 +89,12 @@ impl Ring {
     }
 
     pub unsafe fn get_read_buf(
-        &self,
+        &mut self,
         buffer_group_id: BufferGroupID,
         buffer_id: u16,
         data_len: usize,
     ) -> KernelBuffer {
-        let buf_ring = self.buf_ring_ref(buffer_group_id);
+        let buf_ring = self.borrow_mut(buffer_group_id);
         log::info!("buf_ring at {}", buf_ring as *const _ as usize);
         log::info!(
             "try get_read_buf {buffer_id}. tail = {}",
@@ -142,51 +139,22 @@ impl Ring {
         debug_assert!(data_buf.len >= data_len as u32);
         KernelBuffer {
             addr: data_buf.addr as *const u8,
+            data_len,
+            buf_ring: buf_ring as *mut _,
             bid: data_buf.bid,
             bgid: buffer_group_id,
             buf_len: data_buf.len,
-            data_len,
+            __nonsendable: Default::default(),
         }
     }
 
     #[inline(always)]
-    pub unsafe fn buf_ring_add_advance(&mut self, read_buf: KernelBuffer) {
-        log::info!(
-            "completion return ownership of buffer_{} to kernal",
-            read_buf.bid
-        );
-
-        let KernelBuffer {
-            addr,
-            bid,
-            buf_len,
-            bgid,
-            ..
-        } = read_buf;
-        let buf_ring_ptr = self.buf_ring_ref_mut(read_buf.bgid);
-        io_uring_buf_ring_add(
-            buf_ring_ptr,
-            addr,
-            buf_len,
-            bid,
-            io_uring_buf_ring_mask(RING_POOL_SIZE) as _,
-            0,
-        );
-        io_uring_buf_ring_advance(self.buf_ring_ref_mut(bgid), 1);
-    }
-
-    #[inline(always)]
-    fn ring_ref_mut(&mut self) -> &mut libc::io_uring {
-        unsafe { &mut *self.ring_ptr }
-    }
-
-    #[inline(always)]
-    fn buf_ring_ref(&self, buffer_group_id: BufferGroupID) -> &libc::io_uring_buf_ring {
+    fn borrow(&self, buffer_group_id: BufferGroupID) -> &libc::io_uring_buf_ring {
         unsafe { &*self.buf_ring_ptrs[buffer_group_id as usize] }
     }
 
     #[inline(always)]
-    fn buf_ring_ref_mut(&mut self, buffer_group_id: BufferGroupID) -> &mut libc::io_uring_buf_ring {
+    fn borrow_mut(&mut self, buffer_group_id: BufferGroupID) -> &mut libc::io_uring_buf_ring {
         unsafe { &mut *self.buf_ring_ptrs[buffer_group_id as usize] }
     }
 }
@@ -268,6 +236,32 @@ pub(crate) unsafe fn io_uring_buf_ring_advance(br: &mut libc::io_uring_buf_ring,
     let tail_addr = ptr::addr_of!((&mut br.__bindgen_anon_1.__bindgen_anon_1).tail) as *mut _;
     let tail = atomic::AtomicU16::from_ptr(tail_addr);
     tail.fetch_add(count, atomic::Ordering::Release);
+}
+
+#[inline(always)]
+pub unsafe fn buf_ring_add_advance(read_buf: &mut KernelBuffer) {
+    log::info!(
+        "completion return ownership of buffer_{} to kernal",
+        read_buf.bid
+    );
+
+    let KernelBuffer {
+        buf_ring,
+        addr,
+        bid,
+        buf_len,
+        ..
+    } = read_buf;
+    let buf_ring = &mut **buf_ring;
+    io_uring_buf_ring_add(
+        buf_ring,
+        *addr,
+        *buf_len,
+        *bid,
+        io_uring_buf_ring_mask(RING_POOL_SIZE) as _,
+        0,
+    );
+    io_uring_buf_ring_advance(buf_ring, 1);
 }
 
 /// binding to liburing io_uring_setup_buf_ring

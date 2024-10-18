@@ -8,7 +8,7 @@ use crate::{BGID, BUF_SIZE, RING_POOL_SIZE};
 use core::panic;
 use std::{
     ffi::CString,
-    io::{Cursor, Read},
+    io::Read,
     mem::MaybeUninit,
     ops::DerefMut,
     os::fd::{AsRawFd, RawFd},

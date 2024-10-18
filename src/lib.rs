@@ -19,9 +19,14 @@ pub const BGID: u16 = 0;
 /// large enough to fit one datagram
 pub const BUF_SIZE: u32 = 1500;
 /// rather random. increase if sqe submission are backpressured
-pub const RING_POOL_SIZE: u16 = 2u16.pow(6);
+pub const RING_POOL_SIZE: u16 = 2u16.pow(10);
+
+// allocated_mem_size_per_buffer = 1024 * 1500 = ~1MB
+// max_allocated_mem_size = 1024 * 1500 * 256 = ~300MB
 
 pub const CQE_WAIT_NR: u32 = 1;
+
+pub type NonSendable = std::marker::PhantomData<()>;
 
 #[repr(u8)]
 enum Event {

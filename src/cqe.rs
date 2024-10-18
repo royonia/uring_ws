@@ -1,4 +1,4 @@
-use crate::{read_buf::KernelBuffer, ring::Ring, sys as libc, UserData};
+use crate::{read_buf::KernelBuffer, ring::BufRingPool, sys as libc, UserData};
 
 pub struct Completion {
     pub(crate) ptr: *const libc::io_uring_cqe,
@@ -7,7 +7,7 @@ pub struct Completion {
 }
 
 impl Completion {
-    pub unsafe fn from_raw_ptr(ring: &Ring, ptr: *const libc::io_uring_cqe) -> Self {
+    pub unsafe fn from_raw_event(ring: &mut BufRingPool, ptr: *const libc::io_uring_cqe) -> Self {
         assert!(!ptr.is_null());
         let cqe = &*ptr;
         let user_data = UserData::from_packed(cqe.user_data);
@@ -40,7 +40,9 @@ impl Completion {
 
             log::info!("[{}] completion require {}", user_data.owner(), buffer_id);
 
-            let kernel_buf = ring.get_read_buf(user_data.owner(), buffer_id, data_len);
+            // FIXME: this is a hack that we get buffer group id from user data
+            let buffer_group_id = user_data.owner();
+            let kernel_buf = ring.get_read_buf(buffer_group_id, buffer_id, data_len);
             assert_eq!(kernel_buf.bid, buffer_id);
             Some(kernel_buf)
         } else {
@@ -54,7 +56,8 @@ impl Completion {
         }
     }
 
-    pub fn raw_cqe(&self) -> &libc::io_uring_cqe {
+    // TODO: expose a proper interface to access fields within the raw cqe
+    pub fn as_cqe_ref(&self) -> &libc::io_uring_cqe {
         unsafe { &*self.ptr }
     }
 
@@ -67,6 +70,8 @@ impl Completion {
 
 impl Drop for Completion {
     fn drop(&mut self) {
+        // if there is an attached kernel_buffer it MUST be owned by some handler and do the proper
+        // dropping
         assert!(self.kernel_buf.is_none(), "no one has consumed the kernel buffer and thus no one yield back the ownership to kernel")
     }
 }
