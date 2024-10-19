@@ -5,7 +5,7 @@ use crate::buf_ring::BufRingPool;
 use crate::cqe::Completion;
 use crate::ring::{io_uring_get_sqe, Ring};
 use crate::sys::{self as libc};
-use crate::{op::*, Event, UserData, CQE_WAIT_NR, MAX_BUFFER_GROUP};
+use crate::{op::*, Event, UserData, CQE_WAIT_NR, CQ_ENTRIES, MAX_BUFFER_GROUP};
 use core::panic;
 use std::io;
 use std::{
@@ -46,7 +46,7 @@ pub fn probe_sys_uring() {
 
     let rval = unsafe {
         libc::io_uring_queue_init_params(
-            1024,
+            CQ_ENTRIES,
             std::ptr::addr_of_mut!(ring).cast::<libc::io_uring>(),
             &mut params,
         )

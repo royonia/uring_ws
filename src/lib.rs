@@ -17,6 +17,7 @@ pub type BufferGroupID = u16;
 
 pub const MAX_BUFFER_GROUP: usize = 256;
 
+pub const CQ_ENTRIES: u32 = 1024;
 /// we might actually want a buffer group per connection?
 pub const BGID: u16 = 0;
 /// large enough to fit one datagram
