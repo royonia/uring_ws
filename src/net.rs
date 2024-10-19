@@ -1,41 +1,34 @@
 use crate::cqe::Completion;
 use crate::read_buf::KernelBufferVecReader;
-use crate::ring::SharedRing;
-use crate::RING_POOL_SIZE;
+use crate::ring::{io_uring_sqe_set_data, Ring};
 use crate::{
     sys as libc,
     Event::{self, *},
     UserData,
 };
+use crate::{PhantomUnsend, RING_POOL_SIZE};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::marker::PhantomData;
 use std::os::fd::{AsRawFd, RawFd};
-use std::sync::atomic::AtomicU32;
 
 pub struct TcpStream {
     //inner: Cursor<Vec<u8>>,
     inner: KernelBufferVecReader,
-    ring: SharedRing,
+    ring: Ring,
     // rings related
     owner_id: u16,
     multishort_recv_id: u32,
-    send_id: AtomicU32,
+    send_id: u32,
     pending_sent: HashMap<UserData, Vec<u8>>,
 
     raw: std::net::TcpStream,
     nonblocking: bool,
 
-    __unsafe_mark: PhantomData<()>,
+    _marker_unsend: PhantomUnsend,
 }
 
 impl TcpStream {
-    pub fn new_from_std(
-        raw: std::net::TcpStream,
-        ring: SharedRing,
-        owner_id: u16,
-        recv_id: u32,
-    ) -> Self {
+    pub fn new_from_std(raw: std::net::TcpStream, ring: Ring, owner_id: u16, recv_id: u32) -> Self {
         let inner_buf_size = RING_POOL_SIZE as usize;
         Self {
             inner: KernelBufferVecReader::new(inner_buf_size),
@@ -43,11 +36,11 @@ impl TcpStream {
             ring,
             owner_id,
             multishort_recv_id: recv_id,
-            send_id: AtomicU32::new(0),
+            send_id: 1000,
             pending_sent: Default::default(),
             nonblocking: false,
             raw,
-            __unsafe_mark: Default::default(),
+            _marker_unsend: Default::default(),
         }
     }
 
@@ -66,8 +59,13 @@ impl TcpStream {
             Send => {
                 assert!(completion.as_cqe_ref().res != 0);
 
-                let pending = self.pending_sent.get(&user_data).unwrap();
-                assert_eq!(pending.len(), completion.as_cqe_ref().res as usize);
+                let pending = self.pending_sent.remove(&user_data).unwrap();
+                assert_eq!(
+                    pending.len(),
+                    completion.as_cqe_ref().res as usize,
+                    "unhandled short send"
+                );
+                log::info!("handled Send event {}", user_data.data);
             }
             MultishortRecv => {
                 assert_eq!(user_data.req(), self.multishort_recv_id);
@@ -89,41 +87,49 @@ impl TcpStream {
                 self.inner.push(read_buf);
 
                 //log::info!("_on_cqe read data: {:?}", self.inner);
-
-                // yield back buffer to kernal
             }
         };
         Ok(())
     }
 
+    #[inline]
     pub fn as_raw_fd(&self) -> RawFd {
         self.raw.as_raw_fd()
     }
 
+    #[inline]
     pub fn set_nonblocking(&mut self, v: bool) -> io::Result<()> {
         self.raw.set_nonblocking(v)?;
         self.nonblocking = v;
         Ok(())
     }
 
+    #[inline]
     pub fn set_nodelay(&self, v: bool) -> io::Result<()> {
         self.raw.set_nodelay(v)
+    }
+
+    #[inline]
+    fn next_send_id(&mut self) -> u32 {
+        let ret = self.send_id;
+        self.send_id = self.send_id.wrapping_add(1);
+        ret
     }
 }
 
 impl Read for TcpStream {
     /// read is polled by multishot recv thus this read simply advance the inner buf cursor
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        if self.nonblocking {
-            let len = self.inner.read(buf)?;
-            log::info!("attempted cursor read {} bytes.", len);
-            if len == 0 {
-                Err(io::ErrorKind::WouldBlock.into())
-            } else {
-                Ok(len)
-            }
+        // TODO: mark branch `unlikely`
+        if !self.nonblocking {
+            return self.raw.read(buf);
+        }
+        let len = self.inner.read(buf)?;
+        log::info!("attempted cursor read {} bytes.", len);
+        if len == 0 {
+            Err(io::ErrorKind::WouldBlock.into())
         } else {
-            self.raw.read(buf)
+            Ok(len)
         }
     }
 
@@ -145,28 +151,36 @@ impl Read for TcpStream {
 }
 
 impl Write for TcpStream {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        assert!(!self.nonblocking);
-        self.raw.write(buf)
-    }
     //fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-    //    log::info!("write request: {:?}", buf);
-    //    // get a sqe and prep a write op
-    //    let sqe = unsafe { &mut *self.ring.get_sqe().unwrap() };
-    //    let copied = buf.to_vec();
-    //
-    //    // theres no way to know ahead how much data are sent SUCCESSFULLY
-    //    send(sqe, self.as_raw_fd(), copied.as_ptr(), copied.len() as _, 0);
-    //    let user_data = UserData::from_parts(
-    //        Send as _,
-    //        self.owner_id,
-    //        self.send_id.fetch_add(1, atomic::Ordering::Relaxed),
-    //    );
-    //
-    //    self.pending_sent.insert(user_data, copied);
-    //    Ok(buf.len())
+    //    assert!(!self.nonblocking);
+    //    self.raw.write(buf)
     //}
-    //
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        // TODO: mark branch `unlikely`
+        if !self.nonblocking {
+            return self.raw.write(buf);
+        }
+
+        log::info!("attempt nonblock write {} bytes", buf.len());
+        assert!(buf.len() > 0, "attempt to write an empty buffer");
+
+        let copied = buf.to_vec();
+        let data_ptr = buf.as_ptr();
+        let data_len = buf.len();
+
+        let mut flags = 0i32;
+        //flags |= libc::MSG_WAITALL;
+
+        let sqe = self
+            .ring
+            ._prep_send(self.as_raw_fd(), data_ptr, data_len, flags);
+
+        let user_data = UserData::from_parts(Send as _, self.owner_id, self.next_send_id());
+        unsafe { io_uring_sqe_set_data(sqe, user_data.as_u64()) };
+
+        self.pending_sent.insert(user_data, copied);
+        Ok(buf.len())
+    }
 
     fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {
         todo!()
@@ -181,6 +195,7 @@ impl Write for TcpStream {
         self.raw.write_vectored(bufs)
     }
 
+    #[inline]
     fn flush(&mut self) -> io::Result<()> {
         if !self.nonblocking {
             self.raw.flush()

@@ -1,7 +1,7 @@
-use crate::{ring::buf_ring_add_advance, sys as libc};
+use crate::{buf_ring::buf_ring_add_advance, sys as libc};
 use std::{collections::VecDeque, io::Read};
 
-use crate::NonSendable;
+use crate::PhantomUnsend;
 
 pub struct KernelBuffer {
     /// pointer to the start of buffer data
@@ -19,7 +19,7 @@ pub struct KernelBuffer {
     /// marker to make KernelBuffer is !Send and !Sync
     /// KernelBuffer not thread safe because each kernel buffer return its ownership back to kernel
     /// while dropping - this is not a thread safe operation
-    pub __nonsendable: NonSendable,
+    pub _market_unsend: PhantomUnsend,
 }
 
 impl KernelBuffer {
@@ -72,28 +72,28 @@ impl KernelBufferReader {
         }
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn commit(&mut self, len: usize) {
         self.claimed += len;
         assert!(self.claimed <= self.buf_ref().data_len() as usize);
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn claimed(&self) -> usize {
         self.claimed
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn remaining(&self) -> usize {
         self.buf_ref().data_len() - self.claimed()
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn buf_ref_mut(&mut self) -> &mut KernelBuffer {
         unwrap_option_mut!(self.buf)
     }
 
-    #[inline(always)]
+    #[inline]
     pub fn buf_ref(&self) -> &KernelBuffer {
         unwrap_option!(self.buf)
     }

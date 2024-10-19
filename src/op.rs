@@ -13,10 +13,12 @@ fn open_unchecked(path: impl AsRef<str>) -> RawFd {
     fd as RawFd
 }
 
+#[inline]
 fn close(fd: RawFd) {
     unsafe { libc::close(fd as _) };
 }
 
+#[inline]
 fn read_at(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, offset: u64) {
     sqe.opcode = libc::IORING_OP_READ as u8;
     sqe.fd = fd;
@@ -28,6 +30,7 @@ fn read_at(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, offs
     //sqe.flags |= libc::IOSQE_BUFFER_SELECT;
 }
 
+#[inline]
 pub fn recv(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, flags: libc::c_int) {
     sqe.opcode = libc::IORING_OP_RECV as u8;
     sqe.fd = fd;
@@ -44,6 +47,7 @@ pub fn recv(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, fla
 /// Create a write submission starting at `offset`.
 ///
 /// Avaialable since Linux kernel 5.6.
+#[inline]
 pub fn write_at(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *const u8, len: u32, offset: u64) {
     sqe.opcode = libc::IORING_OP_WRITE as u8;
     sqe.fd = fd;
@@ -52,6 +56,7 @@ pub fn write_at(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *const u8, len: u3
     sqe.len = len;
 }
 
+#[inline]
 pub fn send(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *const u8, len: u32, flags: libc::c_int) {
     sqe.opcode = libc::IORING_OP_SEND as u8;
     sqe.fd = fd;
@@ -62,6 +67,7 @@ pub fn send(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *const u8, len: u32, f
     sqe.len = len;
 }
 
+#[inline]
 pub fn multishot_recv(sqe: &mut libc::io_uring_sqe, fd: RawFd, flags: libc::c_int, buf_group: u16) {
     sqe.opcode = libc::IORING_OP_RECV as u8;
     sqe.fd = fd;

@@ -7,7 +7,8 @@ use crate::ring::{io_uring_get_sqe, Ring};
 use crate::sys::{self as libc};
 use crate::{op::*, Event, UserData, CQE_WAIT_NR, MAX_BUFFER_GROUP};
 use core::panic;
-use std::io;
+use std::io::{self, Write};
+use std::time::Instant;
 use std::{
     mem::MaybeUninit,
     os::fd::RawFd,
@@ -18,7 +19,7 @@ use std::{
     },
 };
 
-pub fn probe_sys_uring() {
+pub fn ping_pong() {
     let mut ring = MaybeUninit::uninit();
 
     // ring wrapper instance
@@ -65,7 +66,7 @@ pub fn probe_sys_uring() {
     // prep read
     let mut handlers = vec![];
     let mut streams = vec![];
-    for owner_id in 0..5 {
+    for owner_id in 0..1 {
         let recv_id = (owner_id + 1200) as u32;
         let (fd, ws) = init_tcp_stream(_ring, owner_id, recv_id);
         let handler =
@@ -95,6 +96,13 @@ pub fn probe_sys_uring() {
         .collect::<Vec<_>>();
 
     loop {
+        for (stream, handler) in streams.iter_mut().zip(handlers.iter_mut()) {
+            if handler.can_write() {
+                handler.write(stream.get_mut(), "ping".into()).unwrap();
+                handler.flush(stream.get_mut()).unwrap();
+                log::info!("SENT PING");
+            }
+        }
         // submit is still required event with SQPOLL
         // io_uring_submit perform a __io_uring_flush_sq to sync kernal state for us
         // it also impose a write barrier to make sure kernal doesn't read a half written sqe
@@ -105,7 +113,7 @@ pub fn probe_sys_uring() {
             let os_err = std::io::Error::last_os_error();
             panic!("{os_err}");
         } else if rval > 0 {
-            log::trace!("submitted {rval} entries");
+            log::info!("submitted {rval} entries");
         }
         let rval = unsafe { libc::io_uring_peek_batch_cqe(&mut ring, cqe_buf.as_mut_ptr(), 10) };
         let to_ready = if rval == 0 {
@@ -138,9 +146,8 @@ pub fn probe_sys_uring() {
             let stream_id = completion.user_data.owner();
             let ws = streams.get_mut(stream_id as usize).unwrap();
             match ws.get_mut() {
-                tungstenite::stream::MaybeTlsStream::NativeTls(s) => {
-                    let stream = s.get_mut();
-                    unsafe { stream.on_completion(completion).unwrap() };
+                tungstenite::stream::MaybeTlsStream::Plain(s) => {
+                    unsafe { s.on_completion(completion).unwrap() };
 
                     let handler = handlers.get_mut(stream_id as usize).unwrap();
                     match handler.read_message_frame(s) {
@@ -153,9 +160,6 @@ pub fn probe_sys_uring() {
                         }
                         Err(err) => panic!("{err}"),
                     };
-                }
-                tungstenite::stream::MaybeTlsStream::Plain(s) => {
-                    todo!()
                 }
                 _ => unimplemented!(),
             }
@@ -201,12 +205,9 @@ fn init_tcp_stream(
             .expect("Failed to install rustls crypto provider");
         true
     });
-    //let (mut ws, response) = connect("ws://0.0.0.0:8765").unwrap();
-    //let (mut ws, response) = connect("wss://ws.okx.com:8443/ws/v5/public").unwrap();
-
-    let tcp_stream = std::net::TcpStream::connect("ws.okx.com:8443").unwrap();
+    let tcp_stream = std::net::TcpStream::connect("100.116.27.104:8765").unwrap();
     let (mut ws, response) = client_tls_with_config(
-        "wss://ws.okx.com:8443/ws/v5/public",
+        "ws://100.116.27.104:8765",
         //tcp_stream,
         crate::net::TcpStream::new_from_std(tcp_stream, ring, owner_id, multishot_recv_id),
         Default::default(),

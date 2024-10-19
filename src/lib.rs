@@ -1,3 +1,6 @@
+use std::fmt::Display;
+
+mod buf_ring;
 mod common;
 mod cqe;
 mod net;
@@ -6,8 +9,8 @@ mod read_buf;
 mod ring;
 mod sys;
 
-pub mod io_uring_probe;
 pub mod io_uring_probe_v2;
+pub mod ping_pong;
 
 pub type OwnID = u16;
 pub type BufferGroupID = u16;
@@ -26,7 +29,7 @@ pub const RING_POOL_SIZE: u16 = 2u16.pow(10);
 
 pub const CQE_WAIT_NR: u32 = 1;
 
-pub type NonSendable = std::marker::PhantomData<()>;
+pub type PhantomUnsend = std::marker::PhantomData<*const ()>;
 
 #[repr(u8)]
 enum Event {
@@ -46,6 +49,12 @@ impl Event {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 struct UserData {
     data: u64,
+}
+
+impl Display for UserData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "UserData({})", self.data)
+    }
 }
 
 impl UserData {

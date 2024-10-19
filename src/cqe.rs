@@ -1,4 +1,4 @@
-use crate::{read_buf::KernelBuffer, ring::BufRingPool, sys as libc, UserData};
+use crate::{buf_ring::BufRingPool, read_buf::KernelBuffer, sys as libc, UserData};
 
 pub struct Completion {
     pub(crate) ptr: *const libc::io_uring_cqe,
