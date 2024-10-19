@@ -1,6 +1,21 @@
-use std::os::fd::RawFd;
+use std::{ffi::CString, os::fd::RawFd};
 
 use crate::sys as libc;
+
+fn open_unchecked(path: impl AsRef<str>) -> RawFd {
+    let fd = unsafe {
+        let path = CString::from_vec_unchecked(
+            path.as_ref().as_bytes().iter().copied().collect::<Vec<_>>(),
+        );
+        let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
+        fd as RawFd
+    };
+    fd as RawFd
+}
+
+fn close(fd: RawFd) {
+    unsafe { libc::close(fd as _) };
+}
 
 fn read_at(sqe: &mut libc::io_uring_sqe, fd: RawFd, ptr: *mut u8, len: u32, offset: u64) {
     sqe.opcode = libc::IORING_OP_READ as u8;

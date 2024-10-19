@@ -30,19 +30,25 @@ pub fn probe_sys_uring() {
     .into_shared();
 
     // using liburing here to greatly reduce io_uring setup boilerplate
+    let kernel_thread = false;
     let mut params: libc::io_uring_params = unsafe { std::mem::zeroed() };
+    // submit all submissions on error
+    // this should be by default enabled for most cases
     params.flags = libc::IORING_SETUP_SUBMIT_ALL;
-    //params.flags |= libc::IORING_SETUP_SQPOLL;
-    //params.flags |= libc::IORING_SETUP_IOPOLL;
-    //params.flags |= libc::IORING_RECVSEND_POLL_FIRST;
-    // if not then set IORING_SETUP_COOP_TASKRUN
-    params.flags |= libc::IORING_SETUP_SINGLE_ISSUER;
-    params.flags |= libc::IORING_SETUP_COOP_TASKRUN;
-    params.flags |= libc::IORING_SETUP_DEFER_TASKRUN;
+    if kernel_thread {
+        // sq_poll is conflict with coop_taskrun
+        params.flags |= libc::IORING_SETUP_SQPOLL;
+        //params.flags |= libc::IORING_SETUP_IOPOLL;
+    } else {
+        // if not then set IORING_SETUP_COOP_TASKRUN
+        params.flags |= libc::IORING_SETUP_COOP_TASKRUN;
+        params.flags |= libc::IORING_SETUP_DEFER_TASKRUN;
+        params.flags |= libc::IORING_SETUP_SINGLE_ISSUER;
+    }
 
     let rval = unsafe { libc::io_uring_queue_init_params(1024, ring_ptr, &mut params) };
     if rval != 0 {
-        let os_err = std::io::Error::last_os_error();
+        let os_err = std::io::Error::from_raw_os_error(rval.abs());
         panic!("{os_err}");
     }
     assert!(params.flags & libc::IORING_FEAT_SQPOLL_NONFIXED != 0);
@@ -165,7 +171,6 @@ fn io_uring_get_sqe(ring: &mut libc::io_uring) -> Result<*mut libc::io_uring_sqe
     let next = sq.sqe_tail.wrapping_add(1);
     let shift = 0;
 
-    //atomic::fence(atomic::Ordering::SeqCst);
     let kernal_head = unsafe { AtomicU32::from_ptr(sq.khead) }.load(atomic::Ordering::Acquire);
     if next.wrapping_sub(kernal_head) <= sq.ring_entries {
         let sqe = unsafe {
@@ -201,21 +206,6 @@ unsafe fn io_uring_cq_advance(ring: &mut libc::io_uring, nr: u32) {
     kernal_head.fetch_add(nr, atomic::Ordering::Release);
 }
 // normal syscalls
-
-fn open_unchecked(path: impl AsRef<str>) -> RawFd {
-    let fd = unsafe {
-        let path = CString::from_vec_unchecked(
-            path.as_ref().as_bytes().iter().copied().collect::<Vec<_>>(),
-        );
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY);
-        fd as RawFd
-    };
-    fd as RawFd
-}
-
-fn close(fd: RawFd) {
-    unsafe { libc::close(fd as _) };
-}
 
 /// using tungstenite here is absolutely overkill
 /// what we want from it is an easy way to perform ssl handshake and websocket upgrade

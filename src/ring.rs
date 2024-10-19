@@ -276,7 +276,7 @@ fn rust_io_uring_setup_buf_ring(
         // flags is currently unused and must be set to zero.
         let buf_ring = libc::io_uring_setup_buf_ring(ring, nentries as _, bgid as _, 0, &mut ret);
         if buf_ring.is_null() {
-            return Err(std::io::Error::from_raw_os_error(ret));
+            return Err(std::io::Error::from_raw_os_error(ret.abs()));
         }
         Ok(&mut *buf_ring)
     }
