@@ -57,6 +57,7 @@ pub fn ping_pong() {
         panic!("{os_err}");
     }
     assert!(params.flags & libc::IORING_FEAT_SQPOLL_NONFIXED != 0);
+    assert!(params.features & libc::IORING_FEAT_EXT_ARG != 0);
 
     let mut ring = unsafe { ring.assume_init() };
     let _ring = Ring::from_raw_ptr(std::ptr::addr_of_mut!(ring));
@@ -100,12 +101,19 @@ pub fn ping_pong() {
     let repeated = pattern.repeat(30); // Repeat the pattern enough times
     let ping_msg = &repeated[..1600];
 
+    let mut last_send: Option<Instant> = None;
+
     loop {
-        for (stream, handler) in streams.iter_mut().zip(handlers.iter_mut()) {
-            if handler.can_write() {
-                handler.write(stream.get_mut(), ping_msg.into()).unwrap();
-                handler.flush(stream.get_mut()).unwrap();
+        if last_send.is_none()
+            || last_send.is_some_and(|v| Instant::now() - v > Duration::from_millis(10))
+        {
+            for (stream, handler) in streams.iter_mut().zip(handlers.iter_mut()) {
+                if handler.can_write() {
+                    handler.write(stream.get_mut(), ping_msg.into()).unwrap();
+                    handler.flush(stream.get_mut()).unwrap();
+                }
             }
+            last_send = Some(Instant::now())
         }
         // submit is still required event with SQPOLL
         // io_uring_submit perform a __io_uring_flush_sq to sync kernal state for us
@@ -122,18 +130,26 @@ pub fn ping_pong() {
         let rval = unsafe { libc::io_uring_peek_batch_cqe(&mut ring, cqe_buf.as_mut_ptr(), 10) };
         let to_ready = if rval == 0 {
             // if no immediate cqes then wait for the first one
+            let mut timeout = libc::__kernel_timespec {
+                tv_sec: 1,
+                tv_nsec: 0,
+            };
             let ret = unsafe {
                 libc::io_uring_wait_cqes(
                     &mut ring,
                     cqe_buf.as_mut_ptr(),
                     CQE_WAIT_NR,
-                    ptr::null_mut() as _,
+                    ptr::addr_of_mut!(timeout),
+                    //ptr::null_mut() as _,
                     ptr::null_mut() as _,
                 )
             };
             if ret < 0 {
-                let os_err = std::io::Error::last_os_error();
-                panic!("{os_err}");
+                if ret == -62 {
+                    // time expired
+                    continue;
+                }
+                panic!("{}", std::io::Error::from_raw_os_error(ret.abs()));
             }
             1
         } else {
