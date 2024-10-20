@@ -57,9 +57,14 @@ impl TcpStream {
 
         match Event::from_u8(user_data.event()) {
             Send => {
-                assert!(completion.as_cqe_ref().res != 0);
+                assert!(
+                    completion.as_cqe_ref().res != 0,
+                    "error: {}",
+                    std::io::Error::from_raw_os_error(completion.as_cqe_ref().res.abs())
+                );
 
                 let pending = self.pending_sent.remove(&user_data).unwrap();
+                // short send is in theory impossible with MSG_WAITALL flag set
                 assert_eq!(
                     pending.len(),
                     completion.as_cqe_ref().res as usize,
@@ -77,7 +82,11 @@ impl TcpStream {
                 );
                 // using the entire user_data just for sqe_id is rather a waste
                 assert_eq!(user_data.req(), self.multishort_recv_id);
-                assert!(completion.as_cqe_ref().res != 0);
+                assert!(
+                    completion.as_cqe_ref().res != 0,
+                    "error: {}",
+                    std::io::Error::from_raw_os_error(completion.as_cqe_ref().res.abs())
+                );
                 assert!(completion.as_cqe_ref().flags & libc::IORING_CQE_F_BUFFER != 0);
 
                 let read_buf = completion
@@ -165,12 +174,15 @@ impl Write for TcpStream {
         assert!(buf.len() > 0, "attempt to write an empty buffer");
 
         let copied = buf.to_vec();
-        let data_ptr = buf.as_ptr();
-        let data_len = buf.len();
+        let data_ptr = copied.as_ptr();
+        let data_len = copied.len();
 
         let mut flags = 0i32;
-        //flags |= libc::MSG_WAITALL;
+        // NOTE: whether this flag works on older kernel version (pre 6.0) is questionable
+        flags |= libc::MSG_WAITALL;
 
+        // TODO: use buffer_select
+        // TODO: use op send_zc: https://lwn.net/Articles/900083/
         let sqe = self
             .ring
             ._prep_send(self.as_raw_fd(), data_ptr, data_len, flags);
@@ -179,7 +191,7 @@ impl Write for TcpStream {
         unsafe { io_uring_sqe_set_data(sqe, user_data.as_u64()) };
 
         self.pending_sent.insert(user_data, copied);
-        Ok(buf.len())
+        Ok(data_len)
     }
 
     fn write_all(&mut self, mut buf: &[u8]) -> io::Result<()> {

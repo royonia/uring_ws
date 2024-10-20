@@ -8,7 +8,7 @@ use crate::sys::{self as libc};
 use crate::{op::*, Event, UserData, CQE_WAIT_NR, CQ_ENTRIES, MAX_BUFFER_GROUP};
 use core::panic;
 use std::io::{self, Write};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     mem::MaybeUninit,
     os::fd::RawFd,
@@ -95,12 +95,16 @@ pub fn ping_pong() {
         .map(|mut v| unsafe { v.assume_init_mut() as *mut _ })
         .collect::<Vec<_>>();
 
+    // generate a large message that is more likely to short send
+    let pattern = "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ";
+    let repeated = pattern.repeat(30); // Repeat the pattern enough times
+    let ping_msg = &repeated[..1600];
+
     loop {
         for (stream, handler) in streams.iter_mut().zip(handlers.iter_mut()) {
             if handler.can_write() {
-                handler.write(stream.get_mut(), "ping".into()).unwrap();
+                handler.write(stream.get_mut(), ping_msg.into()).unwrap();
                 handler.flush(stream.get_mut()).unwrap();
-                log::info!("SENT PING");
             }
         }
         // submit is still required event with SQPOLL
@@ -205,9 +209,12 @@ fn init_tcp_stream(
             .expect("Failed to install rustls crypto provider");
         true
     });
-    let tcp_stream = std::net::TcpStream::connect("100.116.27.104:8765").unwrap();
+
+    //let addr = "100.116.27.104:8765";
+    let addr = "localhost:8765";
+    let tcp_stream = std::net::TcpStream::connect(addr).unwrap();
     let (mut ws, response) = client_tls_with_config(
-        "ws://100.116.27.104:8765",
+        format!("ws://{addr}"),
         //tcp_stream,
         crate::net::TcpStream::new_from_std(tcp_stream, ring, owner_id, multishot_recv_id),
         Default::default(),
@@ -215,48 +222,6 @@ fn init_tcp_stream(
     )
     .unwrap();
     info!("{response:?}");
-    ws.send(
-        r#"
-        {
-          "op": "subscribe",
-          "args": [
-            {
-              "channel": "books",
-              "instId": "BTC-USDT"
-            },
-            {
-              "channel": "books",
-              "instId": "ETH-USDT"
-            },
-            {
-              "channel": "books",
-              "instId": "SOL-USDT"
-            },
-            {
-              "channel": "books",
-              "instId": "BTC-USDT-SWAP"
-            },
-            {
-              "channel": "books",
-              "instId": "ETH-USDT-SWAP"
-            },
-            {
-              "channel": "books",
-              "instId": "SOL-USDT-SWAP"
-            }
-          ]
-        }
-        "#
-        .into(),
-    )
-    .unwrap();
-    let msg = match ws.read() {
-        Ok(msg) => msg.to_text().unwrap().to_string(),
-        Err(_) => todo!(),
-    };
-    info!("{msg}");
-    ws.flush().unwrap();
-
     let fd = match ws.get_mut() {
         tungstenite::stream::MaybeTlsStream::Plain(stream) => {
             stream.set_nonblocking(true).unwrap();
